@@ -1,7 +1,8 @@
 import vertica_python
 import pandas as pd
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 import sys
+import datetime
 
 # =============================================================================
 # 1. CONFIGURATION (ตั้งค่าระบบ)
@@ -22,27 +23,22 @@ MONGO_URI = "mongodb://admin:password@eden206.kube.baac.or.th:27044/"
 MONGO_DB_NAME = "CDP"
 MONGO_COLLECTION_NAME = "phonenum"
 
-# --- MAPPING CONFIGURATION (หัวใจหลัก) ---
-# กำหนดว่า Category ไหน ใช้ Column ไหนจาก Vertica
-# main_col: เบอร์หลัก
-# ext_col : เบอร์ต่อ (ใส่ None ถ้าไม่มี)
-# date_col: วันที่อัปเดตของเบอร์นั้นๆ (เพื่อเอามาหา Active/Inactive)
-
+# --- MAPPING CONFIGURATION ---
 COLUMN_MAPPING = {
     "HOME": {
         "main_col": "HPH",
         "ext_col": "ZHPHEXT",
-        "date_col": "DATE_KEY"  # <-- แก้ชื่อ Column วันที่จริงของเบอร์บ้านที่นี่
+        "date_col": "DATE_KEY"
     },
     "WORK": {
         "main_col": "BPH",
         "ext_col": "BPHEXT",
-        "date_col": "DATE_KEY"  # <-- แก้ชื่อ Column วันที่จริงของเบอร์ที่ทำงานที่นี่
+        "date_col": "DATE_KEY"
     },
     "PERSONAL": {
         "main_col": "APH",
-        "ext_col": None,               # Personal ไม่รวมเบอร์ต่อ
-        "date_col": "DATE_KEY"  # <-- แก้ชื่อ Column วันที่จริงของเบอร์ส่วนตัวที่นี่
+        "ext_col": None,
+        "date_col": "DATE_KEY"
     }
 }
 
@@ -51,9 +47,7 @@ COLUMN_MAPPING = {
 # =============================================================================
 
 def transform_wide_to_long(df_raw):
-    """
-    แปลงข้อมูลจาก Wide Format -> Long Format และจัด Format วันที่เหลือแค่ YYYY-MM-DD
-    """
+    """ แปลงข้อมูลจาก Wide Format -> Long Format """
     all_data_frames = []
 
     for category, cols in COLUMN_MAPPING.items():
@@ -61,9 +55,7 @@ def transform_wide_to_long(df_raw):
         ext_col = cols['ext_col']
         date_col = cols.get('date_col', 'updated_date')
 
-        # เช็ค Column
         if main_col not in df_raw.columns:
-            print(f"Warning: Column '{main_col}' not found. Skipping {category}.")
             continue
             
         if date_col not in df_raw.columns and 'updated_date' in df_raw.columns:
@@ -75,41 +67,29 @@ def transform_wide_to_long(df_raw):
         if sub_df.empty:
             continue
 
-        # =========================================================
-        # แก้ไขจุดที่ 1: เปลี่ยน Format วันที่ตรงนี้
-        # =========================================================
+        # จัด Format วันที่
         try:
-            # แปลงเป็นวันที่ -> จัด Format เอาแค่ ปี-เดือน-วัน
             sub_df['formatted_date'] = pd.to_datetime(sub_df[date_col], errors='coerce') \
                                          .dt.strftime('%Y-%m-%d')
-                                         
-            # ถ้าวันที่เป็น Null/Error ให้ใส่วันที่ Default หรือปล่อยเป็น None
-            # ในที่นี้ใส่ 1970-01-01 เพื่อกัน Error ตอนเปรียบเทียบหา Active
             sub_df['formatted_date'] = sub_df['formatted_date'].fillna("1970-01-01")
         except Exception:
             sub_df['formatted_date'] = "1970-01-01"
 
-        # =========================================================
-
-        # Logic รวมเบอร์ (เหมือนเดิม)
+        # Logic รวมเบอร์
         def combine_phone(row):
             main_num = str(row[main_col]).strip()
-            
             if not ext_col or pd.isna(row[ext_col]):
                 return main_num
-            
             ext_num = str(row[ext_col]).strip()
-            
             if ext_num in ['', '0', '-', 'nan', 'None']:
                 return main_num
-            
             return f"{main_num}:{ext_num}"
 
         temp_df = pd.DataFrame()
         temp_df['cif'] = sub_df[str('ACN')]
         temp_df['source'] = 'CBS'
         temp_df['category'] = category
-        temp_df['fieldUpdatedAt'] = sub_df['formatted_date'] # ค่าที่แปลงแล้ว
+        temp_df['fieldUpdatedAt'] = sub_df['formatted_date']
         temp_df['number'] = sub_df.apply(combine_phone, axis=1)
         
         all_data_frames.append(temp_df)
@@ -120,19 +100,14 @@ def transform_wide_to_long(df_raw):
     return pd.concat(all_data_frames, ignore_index=True)
 
 def group_and_calculate_status(df_long):
-    """
-    Group by CIF -> สร้าง Array -> คำนวณ Active Status
-    """
+    """ คำนวณ Active Status เฉพาะใน Batch ปัจจุบัน """
     def process_cif_group(group):
-        # 1. หา Max Date ของแต่ละ Category ภายในคนๆ นี้
-        # ผลลัพธ์: {'HOME': '2023-12...', 'WORK': '2020-01...'}
+        # หา Max Date ของแต่ละ Category ภายในคนๆ นี้ใน Batch นี้
         max_dates_by_cat = group.groupby('category')['fieldUpdatedAt'].max().to_dict()
         
         records = []
         for _, row in group.iterrows():
             cat = row['category']
-            
-            # 2. เช็คว่าวันที่ของแถวนี้ คือวันที่ล่าสุดของ Category นี้หรือไม่
             is_latest = (row['fieldUpdatedAt'] == max_dates_by_cat.get(cat))
             
             records.append({
@@ -144,8 +119,7 @@ def group_and_calculate_status(df_long):
             })
         return records
 
-    print("Grouping data and calculating status...")
-    # GroupBy CIF และ Apply Logic
+    print("Grouping data and calculating status (in-batch)...")
     return df_long.groupby('cif').apply(process_cif_group).reset_index(name='PhoneNumber')
 
 # =============================================================================
@@ -156,9 +130,9 @@ def run_etl():
     print("--- STARTING ETL ---")
     
     # 1. Read Vertica
-    # ดึงมาแค่ Raw Data ทั้งหมด (หรือเฉพาะ Column ที่จำเป็นถ้าตารางใหญ่มาก)
     print(f"Connecting to Vertica...")
-    sql = "SELECT  ACN,HPH,ZHPHEXT,BPH,BPHEXT,APH,DATE_KEY FROM DA_PROD.cleansing_TB_CBS_CIF_20251031 WHERE ACN >150000 ORDER BY ACN LIMIT 50000" # <-- แก้ชื่อ Table ตรงนี้
+    # SQL Query (ปรับ Limit หรือ Condition ตามต้องการ)
+    sql = "SELECT ACN,HPH,ZHPHEXT,BPH,BPHEXT,APH,DATE_KEY FROM DA_PROD.cleansing_TB_CBS_CIF_20251130 WHERE ACN >2000000 ORDER BY ACN LIMIT 5000"
     
     try:
         with vertica_python.connect(**VERTICA_CONN_INFO) as conn:
@@ -171,9 +145,8 @@ def run_etl():
         print("No data found.")
         return
     
-    df_raw['ACN'] = df_raw['ACN'].astype(str) 
-    df_raw['ACN'] = df_raw['ACN'].apply(lambda x: x.split('.')[0])
-
+    # Clean ACN (เอาจุดทศนิยมออกถ้ามี)
+    df_raw['ACN'] = df_raw['ACN'].astype(str).apply(lambda x: x.split('.')[0])
     print(f"Loaded {len(df_raw)} raw rows.")
 
     # 2. Transform (Wide -> Long)
@@ -187,23 +160,65 @@ def run_etl():
     # 3. Group & Status Logic
     final_df = group_and_calculate_status(df_long)
     
-    # 4. Insert to MongoDB
-    mongo_docs = final_df.to_dict('records')
-    print(f"Prepared {len(mongo_docs)} documents for MongoDB.")
-    
+    # 4. Insert/Update to MongoDB (Logic: Deactivate Old -> Push New)
+    print(f"Prepared {len(final_df)} CIFs. Processing bulk operations...")
+
+    client = None
     try:
         client = MongoClient(MONGO_URI)
         db = client[MONGO_DB_NAME]
         coll = db[MONGO_COLLECTION_NAME]
         
-        if mongo_docs:
-            # ใช้ insert_many เพื่อความเร็ว
-            result = coll.insert_many(mongo_docs)
-            print(f"Successfully inserted {len(result.inserted_ids)} documents.")
+        operations = []
+        
+        # วนลูป CIF แต่ละคน
+        for index, row in final_df.iterrows():
+            cif = row['cif']
+            new_phones_list = row['PhoneNumber'] # list ของเบอร์ใหม่จาก Vertica
             
-        client.close()
+            # วนลูปเบอร์โทรแต่ละเบอร์ใน List
+            for phone_item in new_phones_list:
+                
+                # CASE: เบอร์ใหม่เป็น Active -> ต้องไปปิดเบอร์เก่าก่อน
+                if phone_item['status'] == 'Active':
+                    target_category = phone_item['category']
+                    
+                    # Op 1: หาเบอร์เก่าที่เป็น Category เดียวกัน แล้วแก้เป็น Inactive
+                    op_deactivate = UpdateOne(
+                        {'cif': cif}, 
+                        {'$set': {'PhoneNumber.$[elem].status': 'Inactive'}}, 
+                        array_filters=[{'elem.category': target_category}],   
+                        upsert=False
+                    )
+                    operations.append(op_deactivate)
+
+                # Op 2: เอาเบอร์ใหม่ใส่เข้าไป (Push)
+                # ใช้ upsert=True เพื่อว่าถ้าเป็น CIF ใหม่ที่ไม่เคยมี document เลย จะได้สร้างให้
+                op_push = UpdateOne(
+                    {'cif': cif},
+                    {
+                        '$push': {'PhoneNumber': phone_item},
+                        # อัปเดตเวลาแก้ไขล่าสุดของ Document (Optional)
+                        # '$set': {'last_updated': datetime.datetime.now()} 
+                    },
+                    upsert=True 
+                )
+                operations.append(op_push)
+
+        # ยิงคำสั่งเข้า MongoDB (Bulk Write)
+        if operations:
+            print(f"Executing {len(operations)} operations...")
+            # ordered=True สำคัญมาก! เพื่อให้ Deactivate ทำงานก่อน Push เสมอ
+            result = coll.bulk_write(operations, ordered=True)
+            print(f"Done! Matched: {result.matched_count}, Modified: {result.modified_count}, Upserted: {result.upserted_count}")
+        else:
+            print("No operations to execute.")
+            
     except Exception as e:
         print(f"Error writing to MongoDB: {e}")
+    finally:
+        if client:
+            client.close()
 
     print("--- FINISHED ---")
 

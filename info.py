@@ -24,17 +24,39 @@ MONGO_COLLECTION = 'info'
 
 BATCH_SIZE = 5000
 
-# กำหนดค่า Source ตายตัวที่นี่ (ไม่ต้องดึงจาก DB)
+import vertica_python
+from pymongo import MongoClient, UpdateOne
+from itertools import groupby
+import datetime
+from decimal import Decimal
+import json
+import re
+
+# ==============================================================================
+# PART 1: CONFIGURATION
+# ==============================================================================
+VERTICA_CONN_INFO = {
+    'host': '172.26.133.65',
+    'port': 5433,
+    'user': 'P6600566',
+    'password': 'P@6600566',
+    'database': 'BAACDWH',
+    'read_timeout': 600,
+    'tlsmode': 'disable'
+}
+
+MONGO_URI = 'mongodb://admin:password@eden206.kube.baac.or.th:27044/'
+MONGO_DB = 'CDP'
+MONGO_COLLECTION = 'info'
+BATCH_SIZE = 2000 # ลดขนาดลงนิดหน่อยเพราะ 1 CIF จะสร้าง 2 Operations
+
 FIXED_SOURCE_VALUE = "CBS"
 
 # ==============================================================================
 # PART 2: MAPPING CONFIGURATION
 # ==============================================================================
-# ฝั่งซ้าย: Column Vertica
-# ฝั่งขวา: Key ใน MongoDB
-# หมายเหตุ: ตัด SRC_STM ออก เพราะจะใช้ค่า Fixed แทน
 PROFILE_MAPPING = {
-    "ACN": "cif",            # Key นี้ใช้สำหรับ Grouping
+    "ACN": "cif",
     "ZTITLE": "title",
     "FNAME": "firstName",
     "LNM": "lastName",
@@ -53,50 +75,27 @@ PROFILE_MAPPING = {
     "REC_STATUS": "status"
 }
 
-# Column ที่ใช้ Sort หา record ล่าสุด
-SORT_DATE_COL = "LAST_UPD" 
+# [สำคัญ] แก้ชื่อ Column วันที่สำหรับ Sort ให้ตรงกับ Query SQL ด้านล่าง
+SORT_DATE_COL = "DATE_KEY" 
 
 # ==============================================================================
-# PART 3: HELPER FUNCTIONS
+# PART 3: HELPER FUNCTIONS (คงเดิม)
 # ==============================================================================
 
 def sanitize_text(val):
-    """
-    *** พระเอกของเรา: ตัวกรองขยะ ***
-    หน้าที่: รับค่ามา แล้วคัดเอาเฉพาะภาษาไทย อังกฤษ และตัวเลข
-    ทิ้งตัวอักษรจีน หรือสัญลักษณ์ต่างดาว
-    """
-    if val is None:
-        return None
-    
-    # แปลงเป็น String และตัดช่องว่างซ้ายขวาก่อน
+    if val is None: return None
     val_str = str(val).strip()
-    if val_str == "":
-        return None
-
-    # Logic: วนลูปเช็คทีละตัวอักษร
-    # เก็บเฉพาะ:
-    # 1. ภาษาไทย (\u0e00 - \u0e7f)
-    # 2. ASCII มาตรฐาน (ตัวเลข, อังกฤษ, เครื่องหมายวรรคตอน) (Code 32-126)
-    cleaned_chars = [
-        c for c in val_str 
-        if (0x0e00 <= ord(c) <= 0x0e7f) or (32 <= ord(c) <= 126)
-    ]
-    
-    # รวมกลับเป็นข้อความ
+    if val_str == "": return None
+    cleaned_chars = [c for c in val_str if (0x0e00 <= ord(c) <= 0x0e7f) or (32 <= ord(c) <= 126)]
     result = "".join(cleaned_chars).strip()
-    
-    # ถ้ากรองแล้วไม่เหลืออะไรเลย (เช่น เดิมเป็นภาษาจีนล้วน) ให้ส่งกลับเป็น None
     return result if result else None
 
 def format_date_iso(dt):
-    """สำหรับ fieldUpdatedAt"""
     if isinstance(dt, (datetime.date, datetime.datetime)):
         return dt.isoformat()
     return None
 
 def format_date_simple(dt):
-    """สำหรับ birthDate/deathDate"""
     if isinstance(dt, datetime.datetime):
         return dt.date().isoformat()
     elif isinstance(dt, datetime.date):
@@ -104,52 +103,35 @@ def format_date_simple(dt):
     return str(dt) if dt else None
 
 def clean_value(val):
-    """
-    ตัวกลางจัดการข้อมูล:
-    1. ถ้าเป็นตัวเลข Decimal -> แปลงเป็น int/float
-    2. ถ้าเป็น String -> ส่งให้พระเอก sanitize_text จัดการ
-    """
-    # จัดการ Decimal จาก Database
     if isinstance(val, Decimal):
         return int(val) if val % 1 == 0 else float(val)
-    
-    # จัดการ String ผ่านพระเอกของเรา
     if isinstance(val, str):
         return sanitize_text(val)
-        
     return val
 
 def build_profile_entry(row, calculated_status):
-    """สร้าง Dict สำหรับ Profile"""
-    entry = {
-        "source": FIXED_SOURCE_VALUE
-    }
-    
+    entry = { "source": FIXED_SOURCE_VALUE }
     for vertica_col, mongo_key in PROFILE_MAPPING.items():
         if vertica_col == "ACN": continue 
-        
         raw_val = row.get(vertica_col)
         
         if mongo_key in ["birthDate", "deathDate"]:
             entry[mongo_key] = format_date_simple(raw_val)
-            
         elif mongo_key == "fieldUpdatedAt":
             entry[mongo_key] = format_date_iso(raw_val)
-            
         elif mongo_key == "status":
+            # ถ้ามีค่า status มาจาก Vertica ให้ใช้ ถ้าไม่มีให้ใช้ที่คำนวณ
             entry[mongo_key] = clean_value(raw_val) if raw_val else calculated_status
-            
         else:
-            # ส่งข้อมูลเข้า clean_value (ซึ่งจะเรียก sanitize_text ต่อ)
             entry[mongo_key] = clean_value(raw_val)
-
     return entry
+
 # ==============================================================================
-# PART 4: MAIN EXECUTION
+# PART 4: MAIN EXECUTION (แก้ไข Logic Update)
 # ==============================================================================
 
 def run_profile_migration():
-    print("🚀 Starting Customer Profile Migration...")
+    print("🚀 Starting Customer Profile Migration (Upsert Mode)...")
     
     mongo_client = MongoClient(MONGO_URI)
     collection = mongo_client[MONGO_DB][MONGO_COLLECTION]
@@ -158,26 +140,20 @@ def run_profile_migration():
         with vertica_python.connect(**VERTICA_CONN_INFO) as conn:
             cursor = conn.cursor()
 
-            # --- DYNAMIC SQL QUERY ---
-            # สร้าง SELECT list จาก Mapping โดยอัตโนมัติ
-            cols_to_select = list(PROFILE_MAPPING.keys())
-            
-            # อย่าลืมใส่ Schema.Table ให้ถูกต้อง
+            # Query ข้อมูล
             query = """
             SELECT 
             ACN,ZCIZID,ZTITLE,FNAME,LNM,ZETITLE,ZEFNAME,ZELNM,
             SEX,DOB,DOD,NATION,MAR,ZKTBCCODE,
             ZSPOUSEID,ZSPOUSETITLE,ZSPOUSENM,ZSPOUSELNM,
             DATE_KEY
-              
-            FROM DA_PROD.cleansing_TB_CBS_CIF_20251031
-            WHERE ACN > 1500000
+            FROM DA_PROD.cleansing_TB_CBS_CIF_20251130
+            WHERE ACN > 2000000
             ORDER BY ACN 
-            LIMIT 50000 
+            LIMIT 5000 
             """
             
             print("⏳ Executing SQL Query...")
-            # print(query) 
             cursor.execute(query)
             
             columns = [desc[0] for desc in cursor.description]
@@ -188,45 +164,72 @@ def run_profile_migration():
                     if not row: break
                     yield dict(zip(columns, row))
 
-            # Grouping by ACN
             grouped_stream = groupby(row_generator(), key=lambda x: x['ACN'])
             
-            batch_docs = []
-            total_inserted = 0
+            bulk_ops = []
+            total_processed = 0
 
-            print("🔄 Processing Data...")
+            print("🔄 Processing Data & Building Bulk Operations...")
 
             for cif, group in grouped_stream:
                 rows_list = list(group)
                 
-                # Sort ข้อมูลตามวันที่อัปเดต (ใหม่สุดขึ้นก่อน) เพื่อหา Active
+                # 1. เรียงลำดับข้อมูลใน Batch เดียวกัน (เอาวันที่ล่าสุดขึ้นก่อน)
                 rows_list.sort(key=lambda r: r.get(SORT_DATE_COL) or datetime.datetime.min, reverse=True)
                 
-                profile_list = []
+                new_profiles = []
+                # 2. เตรียมข้อมูล Profile
                 for i, row in enumerate(rows_list):
-                    # Record แรกถือเป็น Active
+                    # ตัวแรกสุดของ Batch ให้เป็น Active, ตัวรองลงมา (ถ้ามีใน batch เดียวกัน) ให้ Inactive
                     current_status = "Active" if i == 0 else "Inactive"
                     p_entry = build_profile_entry(row, current_status)
-                    profile_list.append(p_entry)
+                    new_profiles.append(p_entry)
 
-                # สร้าง Document ตามโครงสร้างที่ต้องการ
-                document = {
-                    "cif": str(cif),
-                    "profile": profile_list
-                }
-                
-                batch_docs.append(document)
-                
-                if len(batch_docs) >= BATCH_SIZE:
-                    collection.insert_many(batch_docs)
-                    total_inserted += len(batch_docs)
-                    print(f"   -> Inserted {len(batch_docs)} Profiles (Total: {total_inserted})")
-                    batch_docs = []
+                if not new_profiles:
+                    continue
 
-            if batch_docs:
-                collection.insert_many(batch_docs)
-                total_inserted += len(batch_docs)
-                print(f"   -> Inserted remaining {len(batch_docs)} Profiles.")
+                # =========================================================
+                # LOGIC สำคัญ: Deactivate Old -> Push New
+                # =========================================================
+                
+                # Step 1: สั่ง Inactive ข้อมูลเก่า'ทั้งหมด'ที่มีอยู่ใน MongoDB Array
+                # เราใช้ $[all] operator เพื่อ update ทุก element ใน array profile
+                op_deactivate = UpdateOne(
+                    {"cif": str(cif)},
+                    {"$set": {"profile.$[].status": "Inactive"}}
+                    # หมายเหตุ: ถ้า cif ไม่มีอยู่จริง คำสั่งนี้จะไม่ทำอะไร (Matched 0)
+                )
+                bulk_ops.append(op_deactivate)
+
+                # Step 2: Push ข้อมูลใหม่ (Active) เข้าไปต่อท้าย
+                op_push = UpdateOne(
+                    {"cif": str(cif)},
+                    {
+                        "$push": {
+                            "profile": {"$each": new_profiles}
+                        },
+                        # Optional: อัปเดต timestamp ที่ระดับ document หลักว่าแก้ไขเมื่อไหร่
+                        # "$set": {"lastModified": datetime.datetime.now()}
+                    },
+                    upsert=True # สำคัญ: ถ้าไม่มี CIF นี้ ให้สร้างใหม่เลย
+                )
+                bulk_ops.append(op_push)
+
+                # =========================================================
+
+                # Execute Bulk Write เมื่อถึงขนาดที่กำหนด
+                if len(bulk_ops) >= BATCH_SIZE:
+                    # ordered=True สำคัญมาก! เพื่อรับประกันว่า Deactivate ทำงานก่อน Push เสมอ
+                    collection.bulk_write(bulk_ops, ordered=True)
+                    total_processed += (len(bulk_ops) // 2) # หาร 2 เพราะ 1 cif = 2 ops
+                    print(f"   -> Synced {total_processed} CIFs...")
+                    bulk_ops = []
+
+            # Execute ส่วนที่เหลือ
+            if bulk_ops:
+                collection.bulk_write(bulk_ops, ordered=True)
+                total_processed += (len(bulk_ops) // 2)
+                print(f"   -> Synced remaining CIFs.")
                 
     except Exception as e:
         print(f"❌ Error Occurred: {e}")
@@ -234,7 +237,7 @@ def run_profile_migration():
         traceback.print_exc()
     finally:
         mongo_client.close()
-        print(f"\n✅ Job Finished! Total processed: {total_inserted}")
+        print(f"\n✅ Job Finished! Total CIFs processed: {total_processed}")
 
 if __name__ == "__main__":
     run_profile_migration()
