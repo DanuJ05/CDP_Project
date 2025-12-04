@@ -26,7 +26,7 @@ BATCH_SIZE = 2000 # ลดขนาดลงนิดหน่อยเพรา
 MASTER_DATE_COL = "row_updated_at" 
 
 # ==============================================================================
-# PART 2: MAPPING CONFIGURATION (คงเดิม)
+# PART 2: MAPPING CONFIGURATION
 # ==============================================================================
 ADDRESS_MAPPINGS = [
     {
@@ -121,12 +121,40 @@ def build_address_object(row, rule, calculated_status):
         "status": calculated_status
     }
 
+# [NEW] ฟังก์ชันดึง Address ที่ Active อยู่ปัจจุบันใน MongoDB (แยกตาม Source/Category)
+def get_current_active_address(mongo_doc, source, category):
+    if not mongo_doc or 'addresses' not in mongo_doc:
+        return None
+    
+    # วนหาตัวที่เป็น Active ที่ตรงกับ Source และ Category
+    for addr in mongo_doc['addresses']:
+        if addr.get('status') == 'Active' and \
+           addr.get('source') == source and \
+           addr.get('category') == category:
+            return addr
+    return None
+
+# [NEW] ฟังก์ชันเทียบข้อมูล (ไม่สนใจวันที่)
+def is_address_identical(new_addr, old_addr):
+    if not old_addr: return False
+    
+    # field ที่ไม่เอามาเทียบ
+    ignored_keys = {'fieldUpdatedAt', 'status', 'lastModified'}
+    
+    for key, val in new_addr.items():
+        if key in ignored_keys: continue
+        # เทียบค่า (แปลงเป็น string เพื่อความชัวร์)
+        if str(val) != str(old_addr.get(key)):
+            return False
+            
+    return True
+
 # ==============================================================================
-# PART 4: MAIN EXECUTION (Updated Logic)
+# PART 4: MAIN EXECUTION
 # ==============================================================================
 
 def run_full_migration():
-    print("🚀 Starting Migration Process (Upsert/Append Mode)...")
+    print("🚀 Starting Migration Process (Smart Update Mode)...")
     
     mongo_client = MongoClient(MONGO_URI)
     collection = mongo_client[MONGO_DB][MONGO_COLLECTION]
@@ -135,7 +163,6 @@ def run_full_migration():
         with vertica_python.connect(**VERTICA_CONN_INFO) as conn:
             cursor = conn.cursor()
 
-            # SQL Query
             query = """
             SELECT 
                 ACN,
@@ -157,86 +184,120 @@ def run_full_migration():
             
             print("⏳ Executing SQL Query...")
             cursor.execute(query)
-            
             columns = [desc[0] for desc in cursor.description]
-            def row_generator():
-                while True:
-                    row = cursor.fetchone()
-                    if not row: break
-                    yield dict(zip(columns, row))
-
-            grouped_stream = groupby(row_generator(), key=lambda x: x['ACN'])
+            
+            # ดึงข้อมูลทั้งหมดมาไว้ใน Memory (List of Dicts)
+            all_rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+            
+            # Group ข้อมูลตาม ACN (ต้อง sort ก่อน groupby เสมอ)
+            all_rows.sort(key=lambda x: x['ACN'])
+            grouped_data = {k: list(v) for k, v in groupby(all_rows, key=lambda x: x['ACN'])}
+            
+            # เตรียมดึงข้อมูลเก่าจาก MongoDB
+            cif_list = [str(k) for k in grouped_data.keys()]
+            print(f"🔄 Fetching existing data for {len(cif_list)} CIFs from MongoDB...")
+            
+            existing_cursor = collection.find(
+                {"cif": {"$in": cif_list}},
+                {"cif": 1, "addresses": 1}
+            )
+            existing_docs_map = {doc['cif']: doc for doc in existing_cursor}
             
             bulk_ops = []
-            total_ops_count = 0
+            stats = {"updated_timestamp": 0, "appended_new": 0}
 
-            print("🔄 Processing Data...")
+            print("🔄 Processing Data & Building Operations...")
 
-            for ACN, group in grouped_stream:
-                rows_list = list(group)
-                # เรียงตามวันที่ล่าสุดก่อน (เพื่อกำหนด Active)
+            for cif_raw, rows_list in grouped_data.items():
+                cif_str = str(cif_raw)
+                
+                # เรียงตามวันที่ล่าสุดก่อน
                 rows_list.sort(key=lambda r: r.get(MASTER_DATE_COL) or datetime.datetime.min, reverse=True)
                 
-                # เก็บ Address ทั้งหมดของ CIF นี้ที่จะเพิ่มเข้าไป
-                new_addresses_to_push = []
-
-                for i, row in enumerate(rows_list):
-                    current_status = "Active" if i == 0 else "Inactive"
-                    
-                    for rule in ADDRESS_MAPPINGS:
-                        addr_obj = build_address_object(row, rule, current_status)
-                        if addr_obj:
-                            new_addresses_to_push.append(addr_obj)
-
-                if not new_addresses_to_push:
-                    continue
-
-                # =========================================================
-                # LOGIC: Deactivate Old -> Push New
-                # =========================================================
+                # เก็บ Address ใหม่ทั้งหมดที่จะ process จาก Vertica
+                # (Logic เดิม: แถวแรกเป็น Active, ที่เหลือ Inactive)
+                # แต่ใน Smart Update เราสนใจแค่ตัว Active ล่าสุดของ Vertica เพื่อไปเทียบกับ MongoDB
                 
-                cif_str = str(ACN)
-
-                # วนลูปทุก Address ใหม่ที่จะใส่เข้าไป
-                for addr in new_addresses_to_push:
+                latest_row = rows_list[0] # แถวล่าสุด
+                
+                # ดึงข้อมูลเก่าของคนนี้
+                mongo_doc = existing_docs_map.get(cif_str)
+                
+                # วนลูปสร้าง Address Object ตาม Mapping (HOME, WORK, CARDID)
+                for rule in ADDRESS_MAPPINGS:
+                    # สร้าง Object จากข้อมูลใหม่ (ตั้งเป็น Active ไว้ก่อน)
+                    new_addr_obj = build_address_object(latest_row, rule, "Active")
                     
-                    # ถ้า Address ใหม่เป็น Active -> ต้องไปปิดของเก่า (Inactive) ก่อน
-                    if addr['status'] == 'Active':
-                        target_category = addr['category'] # เช่น HOME, WORK
+                    if not new_addr_obj: continue
+                    
+                    target_source = new_addr_obj['source']
+                    target_category = new_addr_obj['category']
+                    
+                    # หา Active Address เดิมใน Mongo
+                    current_active_addr = get_current_active_address(mongo_doc, target_source, target_category)
+                    
+                    # ------------------------------------------------------------------
+                    # CASE 1: ข้อมูลเหมือนเดิมเป๊ะ (Update Timestamp Only)
+                    # ------------------------------------------------------------------
+                    if current_active_addr and is_address_identical(new_addr_obj, current_active_addr):
                         
-                        # Op 1: หา Address เดิมใน MongoDB ที่เป็น Category เดียวกัน แล้วแก้เป็น Inactive
-                        op_deactivate = UpdateOne(
+                        new_updated_at = new_addr_obj['fieldUpdatedAt']
+                        
+                        op_touch = UpdateOne(
                             {'cif': cif_str},
-                            {'$set': {'addresses.$[elem].status': 'Inactive'}},
-                            array_filters=[{'elem.category': target_category}], # กรองเฉพาะสมาชิก array ที่ category ตรงกัน
+                            {'$set': {'addresses.$[elem].fieldUpdatedAt': new_updated_at}},
+                            array_filters=[{
+                                'elem.source': target_source,
+                                'elem.category': target_category,
+                                'elem.status': 'Active'
+                            }],
                             upsert=False
                         )
-                        bulk_ops.append(op_deactivate)
-
-                    # Op 2: เพิ่ม Address นี้เข้าไปใน Array (Push)
-                    op_push = UpdateOne(
-                        {'cif': cif_str},
-                        {
-                            '$push': {'addresses': addr}
-                            # Optional: '$set': {'last_updated': datetime.datetime.now()}
-                        },
-                        upsert=True # ถ้ายังไม่มี CIF นี้ให้สร้างใหม่
-                    )
-                    bulk_ops.append(op_push)
+                        bulk_ops.append(op_touch)
+                        stats["updated_timestamp"] += 1
+                        
+                    # ------------------------------------------------------------------
+                    # CASE 2: ข้อมูลเปลี่ยน หรือ เป็นข้อมูลใหม่ (Deactivate -> Push)
+                    # ------------------------------------------------------------------
+                    else:
+                        # Op 1: ถ้ามีของเก่า ให้ Deactivate ก่อน
+                        if current_active_addr:
+                            op_deactivate = UpdateOne(
+                                {'cif': cif_str},
+                                {'$set': {'addresses.$[elem].status': 'Inactive'}},
+                                array_filters=[{
+                                    'elem.source': target_source,
+                                    'elem.category': target_category,
+                                    'elem.status': 'Active'
+                                }],
+                                upsert=False
+                            )
+                            bulk_ops.append(op_deactivate)
+                        
+                        # Op 2: Push ของใหม่
+                        op_push = UpdateOne(
+                            {'cif': cif_str},
+                            {
+                                '$push': {'addresses': new_addr_obj}
+                            },
+                            upsert=True
+                        )
+                        bulk_ops.append(op_push)
+                        stats["appended_new"] += 1
 
                 # Execute Bulk Write
                 if len(bulk_ops) >= BATCH_SIZE:
-                    # ordered=True สำคัญมาก! เพื่อให้ Deactivate ทำงานก่อน Push
                     collection.bulk_write(bulk_ops, ordered=True)
-                    total_ops_count += len(bulk_ops)
-                    print(f"   -> Executed {len(bulk_ops)} operations...")
+                    print(f"   -> Executed batch operations...")
                     bulk_ops = []
 
             # เก็บตกรายการที่เหลือ
             if bulk_ops:
                 collection.bulk_write(bulk_ops, ordered=True)
-                total_ops_count += len(bulk_ops)
-                print(f"   -> Executed remaining operations.")
+                
+            print(f"\n📊 Summary:")
+            print(f"   - Timestamp Updated (No Change): {stats['updated_timestamp']}")
+            print(f"   - New Address Appended (Changed): {stats['appended_new']}")
                 
     except Exception as e:
         print(f"❌ Error Occurred: {e}")
@@ -244,7 +305,7 @@ def run_full_migration():
         traceback.print_exc()
     finally:
         mongo_client.close()
-        print(f"\n✅ Job Finished! Total operations: {total_ops_count}")
+        print(f"\n✅ Job Finished!")
 
 if __name__ == "__main__":
     run_full_migration()
