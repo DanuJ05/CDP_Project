@@ -22,25 +22,21 @@ VERTICA_CONN_INFO = {
 MONGO_URI = "mongodb://admin:password@eden206.kube.baac.or.th:27044/"
 MONGO_DB_NAME = "CDP"
 MONGO_COLLECTION_NAME = "phonenum"
+BATCH_SIZE = 2000  # จำนวนข้อมูลต่อ 1 ครั้งที่อ่านจาก Vertica
 
-# --- MAPPING CONFIGURATION ---
-COLUMN_MAPPING = {
-    "HOME": {
-        "main_col": "HPH",
-        "ext_col": "ZHPHEXT",
-        "date_col": "DATE_KEY"
-    },
-    "WORK": {
-        "main_col": "BPH",
-        "ext_col": "BPHEXT",
-        "date_col": "DATE_KEY"
-    },
-    "PERSONAL": {
-        "main_col": "APH",
-        "ext_col": None,
-        "date_col": "DATE_KEY"
-    }
-}
+# MAPPING CONFIGURATION
+MAPPING_CONFIG = [
+    { "source": "CBS", "category": "HOME",     "main_col": "HPH", "ext_col": "ZHPHEXT", "date_col": "DATE_KEY" },
+    { "source": "CBS", "category": "WORK",     "main_col": "BPH", "ext_col": "BPHEXT",  "date_col": "DATE_KEY" },
+    { "source": "CBS", "category": "PERSONAL", "main_col": "APH", "ext_col": None,      "date_col": "DATE_KEY" },
+    
+    # Other Sources
+    { "source": "SMS",        "category": "PERSONAL", "main_col": "mobile_no",      "ext_col": None, "date_col": "register_date" },
+    { "source": "LINEMOBILE", "category": "PERSONAL", "main_col": "verify_mobile_no", "ext_col": None, "date_col": "Data_date" },
+    
+    # [AMOBILE]: date_col เป็น None -> จะถูกแทนที่ด้วยวันที่ปัจจุบันใน code
+    { "source": "AMOBILE",    "category": "PERSONAL", "main_col": "PHONE_NUMBER",     "ext_col": None, "date_col": None }
+]
 
 # =============================================================================
 # 2. DATA TRANSFORMATION LOGIC
@@ -49,36 +45,51 @@ COLUMN_MAPPING = {
 def transform_wide_to_long(df_raw):
     """ แปลงข้อมูลจาก Wide Format -> Long Format """
     all_data_frames = []
+    
+    # ดึงวันที่ปัจจุบันเตรียมไว้ (format YYYY-MM-DD)
+    current_date_str = datetime.datetime.now().strftime('%Y-%m-%d')
 
-    for category, cols in COLUMN_MAPPING.items():
-        main_col = cols['main_col']
-        ext_col = cols['ext_col']
-        date_col = cols.get('date_col', 'updated_date')
+    for config in MAPPING_CONFIG:
+        source = config['source']
+        category = config['category']
+        main_col = config['main_col']
+        ext_col = config['ext_col']
+        date_col = config.get('date_col') # อาจจะเป็นชื่อ Column หรือ None
 
+        # เช็คว่ามี Column เบอร์โทรใน DataFrame หรือไม่
         if main_col not in df_raw.columns:
             continue
             
-        if date_col not in df_raw.columns and 'updated_date' in df_raw.columns:
-            date_col = 'updated_date'
-
-        # Filter แถวที่มีเบอร์
+        # Filter เฉพาะแถวที่มีเบอร์
         sub_df = df_raw[df_raw[main_col].notna() & (df_raw[main_col] != '')].copy()
 
         if sub_df.empty:
             continue
 
-        # จัด Format วันที่
-        try:
-            sub_df['formatted_date'] = pd.to_datetime(sub_df[date_col], errors='coerce') \
-                                         .dt.strftime('%Y-%m-%d')
-            sub_df['formatted_date'] = sub_df['formatted_date'].fillna("1970-01-01")
-        except Exception:
-            sub_df['formatted_date'] = "1970-01-01"
+        # =========================================================
+        # [LOGIC จัดการวันที่]
+        # =========================================================
+        if date_col is None:
+            # กรณี AMOBILE: ถ้า config บอกว่าเป็น None ให้ใช้วันที่ปัจจุบัน
+            sub_df['formatted_date'] = current_date_str
+        else:
+            # กรณีอื่นๆ: ให้ดึงจาก Column ใน Vertica
+            # กันเหนียว: ถ้าหา column ไม่เจอให้ลอง updated_date หรือใช้ 1970
+            target_date_col = date_col if date_col in sub_df.columns else 'updated_date'
+            
+            try:
+                if target_date_col in sub_df.columns:
+                    sub_df['formatted_date'] = pd.to_datetime(sub_df[target_date_col], errors='coerce').dt.strftime('%Y-%m-%d')
+                    sub_df['formatted_date'] = sub_df['formatted_date'].fillna("1970-01-01")
+                else:
+                    sub_df['formatted_date'] = "1970-01-01"
+            except Exception:
+                sub_df['formatted_date'] = "1970-01-01"
+        # =========================================================
 
-        # Logic รวมเบอร์
         def combine_phone(row):
             main_num = str(row[main_col]).strip()
-            if not ext_col or pd.isna(row[ext_col]):
+            if not ext_col or pd.isna(row[ext_col]) or ext_col not in row:
                 return main_num
             ext_num = str(row[ext_col]).strip()
             if ext_num in ['', '0', '-', 'nan', 'None']:
@@ -87,7 +98,7 @@ def transform_wide_to_long(df_raw):
 
         temp_df = pd.DataFrame()
         temp_df['cif'] = sub_df[str('ACN')]
-        temp_df['source'] = 'CBS'
+        temp_df['source'] = source
         temp_df['category'] = category
         temp_df['fieldUpdatedAt'] = sub_df['formatted_date']
         temp_df['number'] = sub_df.apply(combine_phone, axis=1)
@@ -100,18 +111,16 @@ def transform_wide_to_long(df_raw):
     return pd.concat(all_data_frames, ignore_index=True)
 
 def group_and_calculate_status(df_long):
-    """ คำนวณ Active Status เฉพาะใน Batch ปัจจุบัน """
+    """ คำนวณ Active Status (Per Source) """
     def process_cif_group(group):
-        # หา Max Date ของแต่ละ Category ภายในคนๆ นี้ใน Batch นี้
-        max_dates_by_cat = group.groupby('category')['fieldUpdatedAt'].max().to_dict()
-        
+        max_dates = group.groupby(['category', 'source'])['fieldUpdatedAt'].max().to_dict()
         records = []
         for _, row in group.iterrows():
             cat = row['category']
-            is_latest = (row['fieldUpdatedAt'] == max_dates_by_cat.get(cat))
-            
+            src = row['source']
+            is_latest = (row['fieldUpdatedAt'] == max_dates.get((cat, src)))
             records.append({
-                'source': row['source'],
+                'source': src,
                 'category': cat,
                 'fieldUpdatedAt': row['fieldUpdatedAt'],
                 'number': row['number'],
@@ -119,11 +128,28 @@ def group_and_calculate_status(df_long):
             })
         return records
 
-    print("Grouping data and calculating status (in-batch)...")
+    print("Grouping data and calculating status...")
     return df_long.groupby('cif').apply(process_cif_group).reset_index(name='PhoneNumber')
 
 # =============================================================================
-# 3. MAIN EXECUTION
+# 3. HELPER FOR CHECKING DUPLICATES
+# =============================================================================
+
+def get_current_active_number(cif_doc, source, category):
+    """ หาเบอร์ Active ปัจจุบันใน MongoDB """
+    if not cif_doc or 'PhoneNumber' not in cif_doc:
+        return None
+    
+    for item in cif_doc['PhoneNumber']:
+        if item.get('status') == 'Active' and \
+           item.get('source') == source and \
+           item.get('category') == category:
+            return item.get('number')
+            
+    return None
+
+# =============================================================================
+# 4. MAIN EXECUTION
 # =============================================================================
 
 def run_etl():
@@ -131,8 +157,25 @@ def run_etl():
     
     # 1. Read Vertica
     print(f"Connecting to Vertica...")
-    # SQL Query (ปรับ Limit หรือ Condition ตามต้องการ)
-    sql = "SELECT ACN,HPH,ZHPHEXT,BPH,BPHEXT,APH,DATE_KEY FROM DA_PROD.cleansing_TB_CBS_CIF_20251130 WHERE ACN >2000000 ORDER BY ACN LIMIT 5000"
+    sql = """
+        SELECT 
+            a.ACN,
+            -- CBS
+            a.HPH,a.ZHPHEXT,a.BPH,a.BPHEXT,a.APH,a.DATE_KEY,
+            -- SMS
+            b.mobile_no,b.register_date,
+            -- LINEMOBILE
+            c.verify_mobile_no,c.Data_date,
+            -- AMOBILE
+            d.PHONE_NUMBER
+        FROM DA_PROD.cleansing_TB_CBS_CIF_20251130 a
+        LEFT JOIN DA_PROD.Mobile_SMS_Master b on a.ACN=b.cif
+        LEFT JOIN DA_PROD.Mobile_Line_Master c on a.ACN=c.cif
+        LEFT JOIN DA_PROD.cleansing_PHONE_MBP d on a.ACN=d.acn
+        WHERE a.ACN > 2000000 
+        ORDER BY a.ACN 
+        LIMIT 5000
+    """
     
     try:
         with vertica_python.connect(**VERTICA_CONN_INFO) as conn:
@@ -145,11 +188,10 @@ def run_etl():
         print("No data found.")
         return
     
-    # Clean ACN (เอาจุดทศนิยมออกถ้ามี)
     df_raw['ACN'] = df_raw['ACN'].astype(str).apply(lambda x: x.split('.')[0])
     print(f"Loaded {len(df_raw)} raw rows.")
 
-    # 2. Transform (Wide -> Long)
+    # 2. Transform (Logic AMOBILE ใช้ Current Date อยู่ที่นี่)
     print("Transforming data format...")
     df_long = transform_wide_to_long(df_raw)
     
@@ -160,8 +202,8 @@ def run_etl():
     # 3. Group & Status Logic
     final_df = group_and_calculate_status(df_long)
     
-    # 4. Insert/Update to MongoDB (Logic: Deactivate Old -> Push New)
-    print(f"Prepared {len(final_df)} CIFs. Processing bulk operations...")
+    # 4. Update MongoDB
+    print(f"Prepared {len(final_df)} CIFs. Checking against existing MongoDB data...")
 
     client = None
     try:
@@ -169,50 +211,79 @@ def run_etl():
         db = client[MONGO_DB_NAME]
         coll = db[MONGO_COLLECTION_NAME]
         
-        operations = []
+        # Pre-fetch Existing Data
+        cif_list_in_batch = final_df['cif'].unique().tolist()
+        existing_cursor = coll.find(
+            {'cif': {'$in': cif_list_in_batch}},
+            {'cif': 1, 'PhoneNumber': 1}
+        )
+        existing_docs_map = {doc['cif']: doc for doc in existing_cursor}
         
-        # วนลูป CIF แต่ละคน
+        operations = []
+        timestamp_updated_count = 0
+        
         for index, row in final_df.iterrows():
             cif = row['cif']
-            new_phones_list = row['PhoneNumber'] # list ของเบอร์ใหม่จาก Vertica
+            new_phones_list = row['PhoneNumber'] 
             
-            # วนลูปเบอร์โทรแต่ละเบอร์ใน List
+            current_doc_in_mongo = existing_docs_map.get(cif)
+            
             for phone_item in new_phones_list:
                 
-                # CASE: เบอร์ใหม่เป็น Active -> ต้องไปปิดเบอร์เก่าก่อน
                 if phone_item['status'] == 'Active':
+                    target_source = phone_item['source']
                     target_category = phone_item['category']
+                    new_number_val = phone_item['number']
+                    new_updated_date = phone_item['fieldUpdatedAt'] # สำหรับ AMOBILE ค่านี้คือ Today แล้ว
                     
-                    # Op 1: หาเบอร์เก่าที่เป็น Category เดียวกัน แล้วแก้เป็น Inactive
-                    op_deactivate = UpdateOne(
-                        {'cif': cif}, 
-                        {'$set': {'PhoneNumber.$[elem].status': 'Inactive'}}, 
-                        array_filters=[{'elem.category': target_category}],   
-                        upsert=False
+                    current_active_num = get_current_active_number(current_doc_in_mongo, target_source, target_category)
+                    
+                    # CASE 1: เบอร์เดิม -> อัปเดตวันที่เป็นปัจจุบัน (Touch)
+                    if current_active_num == new_number_val:
+                        op_update_timestamp = UpdateOne(
+                            {'cif': cif},
+                            {'$set': {'PhoneNumber.$[elem].fieldUpdatedAt': new_updated_date}},
+                            array_filters=[{
+                                'elem.category': target_category,
+                                'elem.source': target_source,
+                                'elem.status': 'Active'
+                            }],
+                            upsert=False
+                        )
+                        operations.append(op_update_timestamp)
+                        timestamp_updated_count += 1
+                        continue 
+                    
+                    # CASE 2: เบอร์ใหม่ -> Deactivate เก่า + Push ใหม่
+                    if current_active_num is not None:
+                         op_deactivate = UpdateOne(
+                            {'cif': cif}, 
+                            {'$set': {'PhoneNumber.$[elem].status': 'Inactive'}}, 
+                            array_filters=[{
+                                'elem.category': target_category,
+                                'elem.source': target_source 
+                            }],   
+                            upsert=False
+                        )
+                         operations.append(op_deactivate)
+
+                    op_push = UpdateOne(
+                        {'cif': cif},
+                        {
+                            '$push': {'PhoneNumber': phone_item}
+                        },
+                        upsert=True 
                     )
-                    operations.append(op_deactivate)
+                    operations.append(op_push)
 
-                # Op 2: เอาเบอร์ใหม่ใส่เข้าไป (Push)
-                # ใช้ upsert=True เพื่อว่าถ้าเป็น CIF ใหม่ที่ไม่เคยมี document เลย จะได้สร้างให้
-                op_push = UpdateOne(
-                    {'cif': cif},
-                    {
-                        '$push': {'PhoneNumber': phone_item},
-                        # อัปเดตเวลาแก้ไขล่าสุดของ Document (Optional)
-                        # '$set': {'last_updated': datetime.datetime.now()} 
-                    },
-                    upsert=True 
-                )
-                operations.append(op_push)
-
-        # ยิงคำสั่งเข้า MongoDB (Bulk Write)
+        print(f"Stats: {timestamp_updated_count} existing records will have timestamp updated.")
+        
         if operations:
             print(f"Executing {len(operations)} operations...")
-            # ordered=True สำคัญมาก! เพื่อให้ Deactivate ทำงานก่อน Push เสมอ
             result = coll.bulk_write(operations, ordered=True)
             print(f"Done! Matched: {result.matched_count}, Modified: {result.modified_count}, Upserted: {result.upserted_count}")
         else:
-            print("No operations to execute.")
+            print("No operations needed.")
             
     except Exception as e:
         print(f"Error writing to MongoDB: {e}")
