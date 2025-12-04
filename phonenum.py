@@ -24,6 +24,7 @@ MONGO_DB_NAME = "CDP"
 MONGO_COLLECTION_NAME = "phonenum"
 BATCH_SIZE = 2000  # จำนวนข้อมูลต่อ 1 ครั้งที่อ่านจาก Vertica
 
+
 # MAPPING CONFIGURATION
 MAPPING_CONFIG = [
     { "source": "CBS", "category": "HOME",     "main_col": "HPH", "ext_col": "ZHPHEXT", "date_col": "DATE_KEY" },
