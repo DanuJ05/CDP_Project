@@ -1,5 +1,7 @@
 ##### CDP_Project
 
+#Upload File
+
 -Info
 
 -Address
@@ -311,3 +313,73 @@ python your_script_name.py
   ]
 }
 ```
+
+------
+
+##API 
+
+📂 โครงสร้างไฟล์
+main.py: Backend API ที่เขียนด้วย FastAPI ทำหน้าที่ดึงข้อมูลจาก MongoDB (Collections: info, address, phonenum)
+
+index.html: Frontend หน้าเว็บสำหรับค้นหาข้อมูลลูกค้าด้วยเลข CIF
+
+.env: ไฟล์เก็บค่า Configuration สำหรับเชื่อมต่อฐานข้อมูล
+
+🛠️ ความต้องการระบบ (Prerequisites)
+Python 3.8 ขึ้นไป
+
+MongoDB Database (ตาม Connection String ที่ระบุ)
+
+🚀 วิธีการติดตั้งและรันโปรเจกต์ (Installation)
+1. ติดตั้ง Library ที่จำเป็น
+เปิด Terminal แล้วรันคำสั่งต่อไปนี้เพื่อติดตั้ง Python Packages ที่ใช้ใน main.py:
+
+Bash
+
+pip install fastapi uvicorn motor pydantic-settings
+(อ้างอิง dependencies จาก main.py: fastapi, motor, pydantic-settings, uvicorn)
+
+2. ตั้งค่า Environment Variables
+สร้างไฟล์ชื่อ .env ในโฟลเดอร์เดียวกับ main.py และใส่ค่าตามตัวอย่างด้านล่าง (แก้ไข MONGO_URL ให้ตรงกับเครื่องของคุณ):
+
+Code snippet
+
+MONGO_URL=mongodb://admin:password@eden206.kube.baac.or.th:27044
+MONGO_DB_NAME=CDP
+(อ้างอิงค่าจากไฟล์ env.txt)
+
+3. รัน Backend Server
+รันคำสั่งนี้ใน Terminal เพื่อเริ่มการทำงานของ API:
+
+Bash
+
+python main.py
+Server จะเริ่มทำงานที่ http://0.0.0.0:8050
+
+API Doc (Swagger UI) เข้าได้ที่: http://localhost:8050/docs
+
+4. ใช้งาน Frontend
+เปิดไฟล์ index.html ด้วย Web Browser (Chrome, Edge, etc.)
+
+ระบบจะเชื่อมต่อ API ไปที่ http://127.0.0.1:8050 โดยอัตโนมัติ
+
+กรอกเลข CIF (เช่น 2001247) แล้วกดปุ่ม ค้นหา
+
+🔌 API Documentation
+GET /search/cif/{cif_id}
+ดึงข้อมูลลูกค้าจากเลข CIF โดยจะรวมข้อมูลจาก 3 แหล่งและคัดเฉพาะสถานะ Active เท่านั้น
+
+Response Example:
+
+JSON
+
+{
+  "cif": "2001247",
+  "info": [ ... ],
+  "addresses": [ ... ],
+  "phone_numbers": [ ... ]
+}
+⚠️ หมายเหตุ
+ตรวจสอบให้แน่ใจว่า Backend (main.py) กำลังรันอยู่ ก่อนที่จะเปิดหน้าเว็บใช้งาน
+
+หากเชื่อมต่อฐานข้อมูลไม่ได้ ให้ตรวจสอบค่า MONGO_URL ในไฟล์ .env อีกครั้ง
