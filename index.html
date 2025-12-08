@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Customer Profile View</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f0f2f5; display: flex; justify-content: center; padding-top: 50px; }
+        .container { background: white; padding: 30px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); width: 600px; }
+        h2 { text-align: center; color: #333; margin-bottom: 25px;}
+        
+        .search-box { display: flex; gap: 10px; margin-bottom: 20px; }
+        input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 5px; font-size: 16px; }
+        button { padding: 10px 20px; background-color: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #0056b3; }
+
+        .section-title { border-bottom: 2px solid #007bff; padding-bottom: 5px; margin-top: 25px; margin-bottom: 15px; font-size: 18px; color: #007bff; font-weight: bold; }
+        .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+        .info-group { margin-bottom: 10px; }
+        .label { font-weight: bold; color: #666; font-size: 14px; display: block; margin-bottom: 4px; }
+        .value { color: #000; font-size: 16px; }
+        
+        .hidden { display: none; }
+        .error { color: #721c24; background-color: #f8d7da; border-color: #f5c6cb; text-align: center; margin-top: 10px; padding: 10px; border-radius: 5px;}
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h2>🔍 ค้นหาข้อมูลลูกค้า (CDP)</h2>
+
+        <div class="search-box">
+            <input type="text" id="cifInput" placeholder="ระบุเลข CIF" value="2001247">
+            <button onclick="searchCIF()">ค้นหา</button>
+        </div>
+
+        <div id="errorMsg" class="error hidden"></div>
+
+        <div id="resultArea" class="hidden">
+            
+            <div class="section-title">👤 ข้อมูลส่วนตัว</div>
+            <div class="info-grid">
+                <div class="info-group">
+                    <span class="label">CIF</span>
+                    <span class="value" id="showCif">-</span>
+                </div>
+                <div class="info-group">
+                    <span class="label">ชื่อ-นามสกุล</span>
+                    <span class="value" id="showName">-</span>
+                </div>
+                <div class="info-group">
+                    <span class="label">เลขบัตรประชาชน</span>
+                    <span class="value" id="showNationalId">-</span>
+                </div>
+                <div class="info-group">
+                    <span class="label">วันเกิด</span>
+                    <span class="value" id="showBirthDate">-</span>
+                </div>
+            </div>
+
+            <div class="section-title">📞 เบอร์โทรศัพท์</div>
+            <div id="phoneList"></div>
+
+            <div class="section-title">🏠 ข้อมูลที่อยู่</div>
+            
+            <div class="info-group">
+                <span class="label">ที่อยู่ตามบัตรประชาชน (CARDID)</span>
+                <span class="value" id="showIdCardAddr">-</span>
+            </div>
+
+            <div class="info-group">
+                <span class="label">ที่อยู่ตามทะเบียนบ้าน (HOME)</span>
+                <span class="value" id="showHouseAddr">-</span>
+            </div>
+
+            <div class="info-group">
+                <span class="label">ที่อยู่ที่ทำงาน (WORK)</span>
+                <span class="value" id="showWorkAddr">-</span>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        // ฟังก์ชันจัดรูปแบบที่อยู่
+        function formatAddress(addrObj) {
+            if (!addrObj) return "<span style='color:#ccc'>- ไม่มีข้อมูล Active -</span>";
+            
+            const parts = [
+                addrObj.houseNo ? `เลขที่ ${addrObj.houseNo}` : '',
+                addrObj.villageNo ? `หมู่ ${addrObj.villageNo}` : '',
+                addrObj.road ? `ถ.${addrObj.road}` : '',
+                addrObj.subdistrictKhwaeng ? `ต.${addrObj.subdistrictKhwaeng}` : '',
+                addrObj.districtKhet ? `อ.${addrObj.districtKhet}` : '',
+                addrObj.province ? `จ.${addrObj.province}` : '',
+                addrObj.postalCode ? `${addrObj.postalCode}` : '',
+                addrObj.country ? `(${addrObj.country})` : ''
+            ];
+            return parts.filter(part => part && part.trim() !== "").join(" ");
+        }
+
+        async function searchCIF() {
+            const cifInput = document.getElementById('cifInput').value.trim();
+            const resultArea = document.getElementById('resultArea');
+            const errorMsg = document.getElementById('errorMsg');
+
+            resultArea.classList.add('hidden');
+            errorMsg.classList.add('hidden');
+            errorMsg.innerText = "";
+
+            if (!cifInput) {
+                errorMsg.innerText = "กรุณากรอกเลข CIF";
+                errorMsg.classList.remove('hidden');
+                return;
+            }
+
+            try {
+                // -----------------------------------------------------------
+                // จุดสำคัญ 1: URL ต้องตรงกับที่ Python รันอยู่
+                // Python ของคุณรันที่ Port 8050
+                // ถ้า Server อยู่ที่อื่น (เช่น Kube) ให้เปลี่ยน IP ตรงนี้
+                // -----------------------------------------------------------
+                const API_URL = `http://127.0.0.1:8050/search/cif/${cifInput}`;
+                
+                const response = await fetch(API_URL);
+
+                if (!response.ok) {
+                    if(response.status === 404) throw new Error("ไม่พบข้อมูล CIF นี้ในระบบ");
+                    throw new Error(`เกิดข้อผิดพลาดในการดึงข้อมูล (Status: ${response.status})`);
+                }
+
+                const data = await response.json();
+                console.log("API Data:", data);
+
+                // --- แสดงผลข้อมูล ---
+                document.getElementById('showCif').innerText = data.cif;
+
+                // 1. Info
+                if (data.info && data.info.length > 0) {
+                    const info = data.info[0];
+                    document.getElementById('showName').innerText = `${info.title || ''}${info.firstName || ''} ${info.lastName || ''}`;
+                    document.getElementById('showNationalId').innerText = info.nationalId || '-';
+                    document.getElementById('showBirthDate').innerText = info.birthDate || '-';
+                } else {
+                     document.getElementById('showName').innerText = "-";
+                     document.getElementById('showNationalId').innerText = "-";
+                     document.getElementById('showBirthDate').innerText = "-";
+                }
+
+                // 2. Phone Numbers
+                const phoneContainer = document.getElementById('phoneList');
+                phoneContainer.innerHTML = "";
+                if (data.phone_numbers && data.phone_numbers.length > 0) {
+                    data.phone_numbers.forEach(p => {
+                        const div = document.createElement('div');
+                        div.className = "info-group";
+                        div.innerHTML = `<span class="label">${p.category} (${p.source})</span><span class="value">${p.number}</span>`;
+                        phoneContainer.appendChild(div);
+                    });
+                } else {
+                    phoneContainer.innerHTML = "<span class='value' style='color:#ccc'>ไม่มีเบอร์โทรศัพท์ Active</span>";
+                }
+
+                // 3. Addresses
+                const addresses = data.addresses || [];
+                const cardAddr = addresses.find(a => a.category === 'CARDID');
+                const homeAddr = addresses.find(a => a.category === 'HOME');
+                const workAddr = addresses.find(a => a.category === 'WORK');
+
+                document.getElementById('showIdCardAddr').innerHTML = formatAddress(cardAddr);
+                document.getElementById('showHouseAddr').innerHTML = formatAddress(homeAddr);
+                document.getElementById('showWorkAddr').innerHTML = formatAddress(workAddr);
+
+                resultArea.classList.remove('hidden');
+
+            } catch (err) {
+                console.error(err);
+                // ถ้าเป็น TypeError: Failed to fetch ส่วนใหญ่คือลืมเปิด CORS หรือ Port ผิด
+                if (err.message.includes("Failed to fetch")) {
+                    errorMsg.innerText = "ไม่สามารถเชื่อมต่อ Server ได้ (ตรวจสอบว่าเปิด Python หรือยัง? หรือติดปัญหา CORS?)";
+                } else {
+                    errorMsg.innerText = err.message;
+                }
+                errorMsg.classList.remove('hidden');
+            }
+        }
+    </script>
+
+</body>
+</html>
